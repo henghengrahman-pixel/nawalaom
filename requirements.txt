@@ -1,0 +1,4 @@
+aiogram==2.25.2
+aiohttp
+beautifulsoup4
+pytz
