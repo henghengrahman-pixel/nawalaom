@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 # Jangan hardcode token bot di file.
 TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [5397964203, 6918801560, 7230912053, 5780186213, 6670157806]
-NAWALA_URL = "https://nawala.in/"
+NAWALA_URL = "https://www.nawala.asia/"
 
 WIB = pytz.timezone("Asia/Jakarta")
 
@@ -289,7 +289,7 @@ def _extract_form_meta(html: str) -> Dict[str, str]:
 
     action = form.get("action") or NAWALA_URL
     if action.startswith("/"):
-        action = "https://nawala.in" + action
+        action = "https://www.nawala.asia" + action
     meta["action"] = action
     meta["method"] = (form.get("method") or "post").strip().lower() or "post"
 
@@ -347,7 +347,7 @@ async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": NAWALA_URL,
-        "Origin": "https://nawala.in",
+        "Origin": "https://www.nawala.asia",
     }
 
     timeout = aiohttp.ClientTimeout(total=45)
@@ -615,7 +615,7 @@ async def start_cmd(message: types.Message):
         "• <code>/cekall</code>\n"
         "• <code>/cekfull ...</code> (BLOKIR dulu, tombol untuk AMAN)\n\n"
         "Ikon: ✅ AMAN • 🟥 BLOKIR • 🟨 ERROR\n"
-        "Catatan: UI baru nawala.in menampilkan badge <b>Blocked</b> / <b>Aman</b>."
+        "Catatan: NawalaAsia menampilkan status <b>Active</b> / <b>Blocked</b> pada kolom <b>Nawala Network</b>."
     )
     await message.reply(info)
 
@@ -866,6 +866,7 @@ async def cekall_cmd(message: types.Message):
 
 # ================== LIFECYCLE ==================
 async def on_startup(_):
+    await bot.delete_webhook(drop_pending_updates=True)
     load_config()
     load_domains()
     _ = load_status_cache()
