@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 # ================== CONFIG ==================
 TOKEN = os.getenv("BOT_TOKEN", "8275254087:AAHP9eplknB77tyCJVljv_KkqYt9vzZKvCQ")
 ADMIN_IDS = [5397964203, 6918801560, 7230912053, 5780186213, 6670157806]
-NAWALA_URL = "https://nawala.in/"
+NAWALA_URL = "https://trustpositif.app/"
 
 WIB = pytz.timezone("Asia/Jakarta")
 
