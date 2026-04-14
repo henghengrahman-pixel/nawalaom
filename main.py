@@ -1,85 +1,72 @@
-# main.py
 import asyncio
-import logging
-import time
-from datetime import datetime
-from html import escape
 import json
+import logging
 import os
 import re as _re
-from typing import List, Tuple, Dict, Optional
 import uuid
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
+import aiohttp
 import pytz
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
-import aiohttp
 from bs4 import BeautifulSoup
 
 # ================== CONFIG ==================
-TOKEN = os.environ.get("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN environment variable tidak diset.\n"
-        "Jalankan: export BOT_TOKEN=xxxxx:yyy\n"
-        "Jangan hardcode token di source code!"
-    )
-
+# Simpan token di environment variable BOT_TOKEN.
+# Jangan hardcode token bot di file.
+TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [5397964203, 6918801560, 7230912053, 5780186213, 6670157806]
-
-# ---- TrustPositif endpoints ----
-TRUSTPOSITIF_BASE   = "https://trustpositif.app"
-TRUSTPOSITIF_API    = "https://api.trustpositif.app/check"   # JSON API (priority)
-TRUSTPOSITIF_WEB    = "https://trustpositif.app/"            # HTML fallback
+NAWALA_URL = "https://nawala.in/"
 
 WIB = pytz.timezone("Asia/Jakarta")
 
-CONFIG_FILE       = "config.json"
-DOMAINS_FILE      = "domains.txt"
+CONFIG_FILE = "config.json"
+DOMAINS_FILE = "domains.txt"
 STATUS_CACHE_FILE = "status_cache.json"
 ALERT_ONLY_FROM_AUTO = True
-
-BATCH_SIZE = 30            # domain per request (trustpositif mendukung 100, tapi kita aman di 30)
-REPORT_TTL = 1800          # detik; REPORT_STORE auto-expire 30 menit
+BATCH_SIZE = 30
 
 # ================== LOGGING ==================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # ================== BOT CORE ==================
+if not TOKEN:
+    logging.warning("BOT_TOKEN belum diset. Bot tidak akan bisa jalan sampai token diisi.")
+
 bot = Bot(token=TOKEN, parse_mode="HTML")
-dp  = Dispatcher(bot)
+dp = Dispatcher(bot)
 
 # ================== STATE (persisted) ==================
-state: Dict = {"target_chat": None, "auto_interval": 0}
-domains:     List[str] = []
-auto_task:   Optional[asyncio.Task] = None
+state = {"target_chat": None, "auto_interval": 0}
+domains: List[str] = []
+auto_task: Optional[asyncio.Task] = None
 shutdown_flag = False
 
-# {token: {"rows": [...], "ts": float}}
-REPORT_STORE: Dict[str, Dict] = {}
-
+REPORT_STORE: Dict[str, List[Tuple[str, str]]] = {}
 
 # ================== UTIL PERSIST ==================
-def save_config() -> None:
+def save_config():
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"Gagal save config: {e}")
 
-def load_config() -> None:
+
+def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                state.update(data or {})
+                if isinstance(data, dict):
+                    state.update(data)
         except Exception as e:
             logging.error(f"Gagal load config: {e}")
 
-def save_domains() -> None:
+
+def save_domains():
     try:
         with open(DOMAINS_FILE, "w", encoding="utf-8") as f:
             for d in domains:
@@ -87,7 +74,8 @@ def save_domains() -> None:
     except Exception as e:
         logging.error(f"Gagal save domains: {e}")
 
-def load_domains() -> None:
+
+def load_domains():
     global domains
     if os.path.exists(DOMAINS_FILE):
         try:
@@ -103,12 +91,14 @@ def load_status_cache() -> Dict[str, str]:
     if os.path.exists(STATUS_CACHE_FILE):
         try:
             with open(STATUS_CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
         except Exception as e:
             logging.error(f"Gagal load status cache: {e}")
     return {}
 
-def save_status_cache(cache: Dict[str, str]) -> None:
+
+def save_status_cache(cache: Dict[str, str]):
     try:
         with open(STATUS_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
@@ -121,83 +111,83 @@ ICONS = {"AMAN": "✅", "BLOKIR": "🟥", "ERROR": "🟨"}
 ORDER = ["BLOKIR", "ERROR", "AMAN"]
 DOMAIN_COL_WIDTH = 32
 
-def now_wib() -> str:
+
+def now_wib():
     return datetime.now(WIB).strftime("%d %B %Y • %H:%M WIB")
+
 
 def clean_domain(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("http://", "").replace("https://", "")
     s = s.split("/")[0].split(":")[0]
+    s = s.lstrip("www.")
     return s
+
 
 def looks_like_domain(s: str) -> bool:
     s = clean_domain(s)
-    return bool(_re.match(
-        r"^(?!-)[a-z0-9-]{1,63}(?<!-)\.[a-z0-9-]{2,}(?:\.[a-z0-9-]{2,})*$", s
-    ))
+    return bool(_re.match(r"^(?!-)[a-z0-9-]{1,63}(?<!-)\.[a-z0-9-]{2,}(?:\.[a-z0-9-]{2,})*$", s))
+
 
 def map_status_text(text: str) -> str:
     """
-    Mapping status dari TrustPositif / nawala ke internal status.
-    TrustPositif API  : "ALLOWED" / "BLOCKED" / "ERROR"
-    TrustPositif HTML : badge "Allowed" / "Blocked" / "Aman" / "Tidak Ada" / "Ada"
-    Return            : AMAN | BLOKIR | ERROR
+    Support UI lama dan baru.
+    Return: AMAN | BLOKIR | ERROR
     """
     t = (text or "").strip().lower()
     t = _re.sub(r"\s+", " ", t)
 
-    # --- prioritas paling eksplisit dulu ---
-    if "tidak ada" in t or "allowed" in t or "not blocked" in t or "safe" in t or "clean" in t:
+    if not t:
+        return "ERROR"
+
+    if "tidak ada" in t:
         return "AMAN"
-    if "blocked" in t or "blokir" in t or "nawala" in t:
-        return "BLOKIR"
-    if "aman" in t:
+    if "not blocked" in t or "notblock" in t:
         return "AMAN"
 
-    # "ada" saja (hati-hati: sudah dipastikan bukan "tidak ada")
+    if "blocked" in t or "blokir" in t or "nawala" in t:
+        return "BLOKIR"
+    if "aman" in t or "safe" in t or "clean" in t:
+        return "AMAN"
+
+    # Fallback lama: teks yang mengandung kata "ada" biasanya berarti terblokir.
     if _re.search(r"\bada\b", t):
         return "BLOKIR"
 
     return "ERROR"
 
+
 def _pad_domain(d: str, width: int = DOMAIN_COL_WIDTH) -> str:
-    return (d[:width - 1] + "…") if len(d) > width else d.ljust(width)
+    return (d[: width - 1] + "…") if len(d) > width else d.ljust(width)
+
 
 def result_line(domain: str, status: str) -> str:
     icon = ICONS.get(status, "🟨")
     return f"<code>{icon} {_pad_domain(domain)} | {status}</code>"
 
+
 def recap(rows: List[Tuple[str, str]]) -> str:
     total = len(rows)
-    aman  = sum(1 for _, s in rows if s == "AMAN")
-    blok  = sum(1 for _, s in rows if s == "BLOKIR")
-    err   = total - aman - blok
+    aman = sum(1 for _, s in rows if s == "AMAN")
+    blok = sum(1 for _, s in rows if s == "BLOKIR")
+    err = total - aman - blok
     return (
-        f"🧮 <b>Rekap:</b> {total} domain • "
-        f"{ICONS['AMAN']} Aman: {aman} • "
-        f"{ICONS['BLOKIR']} Blokir: {blok} • "
-        f"{ICONS['ERROR']} Error: {err}"
+        f"🧮 <b>Rekap:</b> {total} domain • {ICONS['AMAN']} Aman: {aman} • "
+        f"{ICONS['BLOKIR']} Blokir: {blok} • {ICONS['ERROR']} Error: {err}"
     )
 
+
 def chunked(seq: List[str], n: int) -> List[List[str]]:
-    return [seq[i: i + n] for i in range(0, len(seq), n)]
-
-def _purge_old_reports() -> None:
-    """Hapus entry REPORT_STORE yang sudah expired."""
-    cutoff = time.time() - REPORT_TTL
-    expired = [k for k, v in REPORT_STORE.items() if v.get("ts", 0) < cutoff]
-    for k in expired:
-        del REPORT_STORE[k]
+    return [seq[i : i + n] for i in range(0, len(seq), n)]
 
 
-# ================== PARSER HTML (fallback) ==================
-def _parse_html_for_rows(
-    html: str, requested_domains: List[str]
-) -> List[Tuple[str, str]]:
+# ================== PARSER HTML NAWALA ==================
+def _parse_nawala_html_for_rows(html: str, requested_domains: List[str]) -> List[Tuple[str, str]]:
     """
-    Fallback HTML parser — dipakai saat JSON API gagal.
-    Cari tabel dengan header Domain + Status/Keterangan,
-    ambil badge text, fallback regex.
+    Parser tahan perubahan UI:
+    - Cari tabel hasil yang headernya mengandung Domain + Status/Keterangan
+    - Ambil badge/text status
+    - Fallback regex sekitar domain
     """
     soup = BeautifulSoup(html, "html.parser")
     found_map: Dict[str, str] = {}
@@ -205,6 +195,7 @@ def _parse_html_for_rows(
     def norm(s: str) -> str:
         return (s or "").strip().lower()
 
+    # 1) Table-based extraction
     for table in soup.find_all("table"):
         headers: List[str] = []
         thead = table.find("thead")
@@ -225,17 +216,11 @@ def _parse_html_for_rows(
             continue
 
         try:
-            idx_dom = next(
-                i for i, h in enumerate(hnorm)
-                if "domain" in h or "situs" in h or "website" in h
-            )
+            idx_dom = next(i for i, h in enumerate(hnorm) if "domain" in h or "situs" in h or "website" in h)
         except StopIteration:
             idx_dom = 0
         try:
-            idx_st = next(
-                i for i, h in enumerate(hnorm)
-                if "status" in h or "keterangan" in h
-            )
+            idx_st = next(i for i, h in enumerate(hnorm) if "status" in h or "keterangan" in h)
         except StopIteration:
             idx_st = min(1, len(headers) - 1)
 
@@ -243,226 +228,162 @@ def _parse_html_for_rows(
         for tbody in tbodies:
             for tr in tbody.find_all("tr"):
                 tds = tr.find_all("td")
-                if not tds:
-                    continue
-                if len(tds) <= max(idx_dom, idx_st):
+                if not tds or len(tds) <= max(idx_dom, idx_st):
                     continue
 
                 dom = clean_domain(tds[idx_dom].get_text(" ", strip=True))
+                if not looks_like_domain(dom):
+                    continue
+
                 status_cell = tds[idx_st]
+                badge_text = ""
                 badge = status_cell.find(class_=_re.compile(r"badge", _re.I))
-                st_text = (badge.get_text(" ", strip=True) if badge
-                           else status_cell.get_text(" ", strip=True))
+                if badge:
+                    badge_text = badge.get_text(" ", strip=True)
+                st_text = badge_text or status_cell.get_text(" ", strip=True)
+                found_map[dom] = map_status_text(st_text)
 
-                if looks_like_domain(dom):
-                    found_map[dom] = map_status_text(st_text)
-
-    # Fallback regex — batas 2000 char dari posisi domain supaya tidak lompat jauh
+    # 2) Direct text fallback near requested domain
     html_one = " ".join(html.split())
     for d in requested_domains:
         if d in found_map:
             continue
-        start = html_one.lower().find(d.lower())
-        if start == -1:
-            continue
-        snippet = html_one[start: start + 2000]
         pat = _re.compile(
-            r"(blocked|allowed|aman|tidak\s*ada|ada)",
-            _re.IGNORECASE,
+            rf"{_re.escape(d)}.*?(blocked|aman|tidak\s*ada|ada)",
+            _re.IGNORECASE | _re.DOTALL,
         )
-        m = pat.search(snippet)
+        m = pat.search(html_one)
         if m:
             found_map[d] = map_status_text(m.group(1))
 
-    return [(d, found_map.get(d, "ERROR")) for d in requested_domains]
+    # 3) Output urut sesuai input, kalau tidak ketemu => ERROR
+    out: List[Tuple[str, str]] = []
+    for d in requested_domains:
+        out.append((d, found_map.get(d, "ERROR")))
+    return out
 
 
 # ================== REQUEST HELPER ==================
-_COMMON_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-
-async def _fetch_hidden_inputs(session: aiohttp.ClientSession) -> Dict[str, str]:
-    """Ambil hidden input CSRF dari halaman web (untuk fallback HTML)."""
-    try:
-        async with session.get(
-            TRUSTPOSITIF_WEB,
-            headers={**_COMMON_HEADERS, "Accept": "text/html"},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as r:
-            html = await r.text()
-    except Exception:
-        return {}
-
+def _extract_form_meta(html: str) -> Dict[str, str]:
+    """
+    Coba ambil action, method, dan field domain dari form utama.
+    Kalau struktur website berubah, bot tetap punya fallback.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    data: Dict[str, str] = {}
-    for inp in soup.find_all("input"):
-        tp   = (inp.get("type") or "").lower()
-        name = inp.get("name")
-        if tp == "hidden" and name:
-            data[name] = inp.get("value") or ""
-    return data
+    form = None
 
-
-# ================== CEK KE TRUSTPOSITIF (JSON API) ==================
-async def _cek_via_json_api(
-    session: aiohttp.ClientSession,
-    domain_list: List[str],
-) -> Optional[List[Tuple[str, str]]]:
-    """
-    Coba kirim ke JSON API trustpositif.
-    Return list hasil, atau None jika gagal / tidak support.
-    """
-    payload = {"domains": domain_list}
-    headers = {
-        **_COMMON_HEADERS,
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
-        "Origin":       TRUSTPOSITIF_BASE,
-        "Referer":      TRUSTPOSITIF_WEB,
-    }
-    try:
-        async with session.post(
-            TRUSTPOSITIF_API,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=45),
-            allow_redirects=True,
-        ) as r:
-            if r.status not in (200, 201):
-                logging.warning(f"TrustPositif JSON API HTTP {r.status}")
-                return None
-
-            ct = r.headers.get("Content-Type", "")
-            if "json" not in ct:
-                logging.warning(f"TrustPositif JSON API bukan JSON response: {ct}")
-                return None
-
-            data = await r.json(content_type=None)
-
-    except asyncio.TimeoutError:
-        logging.warning("TrustPositif JSON API timeout")
-        return None
-    except Exception as e:
-        logging.warning(f"TrustPositif JSON API error: {e}")
-        return None
-
-    # --- Parse berbagai kemungkinan struktur response ---
-    results: List[Tuple[str, str]] = []
-
-    # Format 1: {"results": [{"domain": "...", "status": "ALLOWED"}, ...]}
-    if isinstance(data, dict) and "results" in data:
-        items = data["results"]
-        if isinstance(items, list):
-            found: Dict[str, str] = {}
-            for item in items:
-                if isinstance(item, dict):
-                    dom    = clean_domain(str(item.get("domain", "")))
-                    status = map_status_text(str(item.get("status", "")))
-                    if dom:
-                        found[dom] = status
-            return [(d, found.get(d, "ERROR")) for d in domain_list]
-
-    # Format 2: {"data": [...]}
-    if isinstance(data, dict) and "data" in data:
-        items = data["data"]
-        if isinstance(items, list):
-            found = {}
-            for item in items:
-                if isinstance(item, dict):
-                    dom    = clean_domain(str(item.get("domain", item.get("host", ""))))
-                    status = map_status_text(str(item.get("status", item.get("result", ""))))
-                    if dom:
-                        found[dom] = status
-            return [(d, found.get(d, "ERROR")) for d in domain_list]
-
-    # Format 3: [{"domain": "...", "status": "..."}] (array langsung)
-    if isinstance(data, list):
-        found = {}
-        for item in data:
-            if isinstance(item, dict):
-                dom    = clean_domain(str(item.get("domain", "")))
-                status = map_status_text(str(item.get("status", "")))
-                if dom:
-                    found[dom] = status
-        return [(d, found.get(d, "ERROR")) for d in domain_list]
-
-    logging.warning(f"TrustPositif JSON API struktur tidak dikenal: {str(data)[:200]}")
-    return None
-
-
-# ================== CEK KE TRUSTPOSITIF (HTML fallback) ==================
-async def _cek_via_html(
-    session: aiohttp.ClientSession,
-    domain_list: List[str],
-) -> List[Tuple[str, str]]:
-    """
-    Fallback: POST form ke halaman web, parse HTML hasil.
-    """
-    hidden = await _fetch_hidden_inputs(session)
-    payload = {**hidden, "domains": "\n".join(domain_list)}
-    headers = {
-        **_COMMON_HEADERS,
-        "Accept":       "text/html,application/xhtml+xml",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin":       TRUSTPOSITIF_BASE,
-        "Referer":      TRUSTPOSITIF_WEB,
-    }
-    try:
-        async with session.post(
-            TRUSTPOSITIF_WEB,
-            data=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=45),
-            allow_redirects=True,
-        ) as r:
-            if r.status != 200:
-                logging.warning(f"TrustPositif HTML fallback HTTP {r.status}")
-                return [(d, "ERROR") for d in domain_list]
-            text = await r.text()
-    except Exception as e:
-        logging.error(f"TrustPositif HTML fallback error: {e}")
-        return [(d, "ERROR") for d in domain_list]
-
-    return _parse_html_for_rows(text, domain_list)
-
-
-# ================== CEK UTAMA ==================
-async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
-    """
-    Cek domain ke TrustPositif.
-    Prioritas: JSON API → fallback HTML form.
-    """
-    # Deduplikasi & validasi
-    seen: set = set()
-    uniq: List[str] = []
-    for d in domains_in:
-        dc = clean_domain(d)
-        if dc and looks_like_domain(dc) and dc not in seen:
-            uniq.append(dc)
-            seen.add(dc)
-        if len(uniq) >= BATCH_SIZE:
+    # Pilih form yang paling mungkin berhubungan dengan domain checker
+    for candidate in soup.find_all("form"):
+        text = candidate.get_text(" ", strip=True).lower()
+        attrs = " ".join(str(v) for v in candidate.attrs.values()).lower()
+        if any(k in text or k in attrs for k in ["domain", "nawala", "cek", "check", "filter"]):
+            form = candidate
             break
 
+    if form is None:
+        form = soup.find("form")
+
+    meta = {"action": NAWALA_URL, "method": "post", "field": "domains"}
+    if not form:
+        return meta
+
+    action = form.get("action") or NAWALA_URL
+    if action.startswith("/"):
+        action = "https://nawala.in" + action
+    meta["action"] = action
+    meta["method"] = (form.get("method") or "post").strip().lower() or "post"
+
+    # cari textarea / input yang paling mungkin jadi field domain
+    candidates = []
+    for el in form.find_all(["textarea", "input"]):
+        name = (el.get("name") or "").strip()
+        if not name:
+            continue
+        placeholder = (el.get("placeholder") or "").lower()
+        el_id = (el.get("id") or "").lower()
+        cls = " ".join(el.get("class") or []).lower()
+        label_text = " ".join([
+            placeholder,
+            el_id,
+            cls,
+            name.lower(),
+        ])
+        score = 0
+        for key in ["domain", "domains", "url", "site", "situs", "website", "list"]:
+            if key in label_text:
+                score += 2
+        if el.name == "textarea":
+            score += 1
+        candidates.append((score, name, el.name))
+
+    if candidates:
+        candidates.sort(key=lambda x: (x[0], x[2] == "input"), reverse=True)
+        meta["field"] = candidates[0][1]
+
+    return meta
+
+
+async def _fetch_home_html(session: aiohttp.ClientSession) -> str:
+    async with session.get(NAWALA_URL, timeout=30) as r:
+        return await r.text()
+
+
+# ================== CEK KE NAWALA.IN ==================
+async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
+    ds = [clean_domain(d) for d in domains_in if looks_like_domain(d)]
+    seen = set()
+    uniq: List[str] = []
+    for d in ds:
+        if d and d not in seen:
+            uniq.append(d)
+            seen.add(d)
+        if len(uniq) >= BATCH_SIZE:
+            break
     if not uniq:
         return []
 
-    connector = aiohttp.TCPConnector(ssl=True)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # 1) Coba JSON API
-        rows = await _cek_via_json_api(session, uniq)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": NAWALA_URL,
+        "Origin": "https://nawala.in",
+    }
 
-        # 2) Jika gagal, fallback HTML
-        if rows is None:
-            logging.info("JSON API gagal, fallback ke HTML form…")
-            rows = await _cek_via_html(session, uniq)
+    timeout = aiohttp.ClientTimeout(total=45)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        try:
+            home_html = await _fetch_home_html(session)
+        except Exception:
+            home_html = ""
 
+        form_meta = _extract_form_meta(home_html) if home_html else {"action": NAWALA_URL, "method": "post", "field": "domains"}
+        hidden = {}
+        if home_html:
+            soup = BeautifulSoup(home_html, "html.parser")
+            for inp in soup.find_all("input"):
+                tp = (inp.get("type") or "").lower()
+                name = inp.get("name")
+                if tp == "hidden" and name:
+                    hidden[name] = inp.get("value") or ""
+
+        payload = {**hidden, form_meta["field"]: "\n".join(uniq)}
+        action = form_meta["action"] or NAWALA_URL
+        method = form_meta["method"].lower()
+
+        try:
+            if method == "get":
+                async with session.get(action, params=payload, allow_redirects=True) as r:
+                    text = await r.text()
+            else:
+                async with session.post(action, data=payload, allow_redirects=True) as r:
+                    text = await r.text()
+        except Exception:
+            # Fallback: kirim ke homepage langsung kalau action berubah
+            async with session.post(NAWALA_URL, data=payload, allow_redirects=True) as r:
+                text = await r.text()
+
+    rows = _parse_nawala_html_for_rows(text, uniq)
     return rows
 
 
@@ -481,7 +402,7 @@ async def cek_semua_dalam_batch(ds: List[str]) -> List[Tuple[str, str]]:
                 logging.error(f"Gagal batch cek: {e}")
                 hasil += [(x, "ERROR") for x in batch]
             batch = []
-            await asyncio.sleep(1.5)  # sedikit lebih lama agar tidak rate-limit
+            await asyncio.sleep(1)
 
     if batch:
         try:
@@ -494,14 +415,15 @@ async def cek_semua_dalam_batch(ds: List[str]) -> List[Tuple[str, str]]:
 
 
 # ================== BUILDER LAPORAN ==================
-def _group_rows(rows: List[Tuple[str, str]]) -> Dict[str, List[str]]:
-    g: Dict[str, List[str]] = {"AMAN": [], "BLOKIR": [], "ERROR": []}
+def _group_rows(rows: List[Tuple[str, str]]):
+    g = {"AMAN": [], "BLOKIR": [], "ERROR": []}
     for d, s in rows:
         s2 = s if s in g else "ERROR"
         g[s2].append(d)
     for k in g:
         g[k] = sorted(set(g[k]))
     return g
+
 
 def _compose_message(rows: List[Tuple[str, str]], title: str) -> str:
     g = _group_rows(rows)
@@ -513,7 +435,7 @@ def _compose_message(rows: List[Tuple[str, str]], title: str) -> str:
     sections = []
     for key in ORDER:
         items = g[key]
-        icon  = ICONS[key]
+        icon = ICONS[key]
         if not items:
             sections.append(f"<b>{icon} {key}</b>:\n<code>—</code>")
             continue
@@ -523,9 +445,8 @@ def _compose_message(rows: List[Tuple[str, str]], title: str) -> str:
     tail = "\n\n" + recap(rows)
     return f"{head}\n\n{body}{tail}"
 
-def _compose_message_filtered(
-    rows: List[Tuple[str, str]], title: str, show_aman: bool = False
-) -> str:
+
+def _compose_message_filtered(rows: List[Tuple[str, str]], title: str, show_aman: bool = False) -> str:
     g = _group_rows(rows)
     head = (
         f"┏━━━ 🛰 <b>{title}</b>\n"
@@ -535,36 +456,29 @@ def _compose_message_filtered(
     sections = []
 
     blok = g["BLOKIR"]
-    sections.append(
-        f"<b>{ICONS['BLOKIR']} BLOKIR</b>:\n"
-        + ("\n".join(result_line(d, "BLOKIR") for d in blok) if blok else "<code>—</code>")
-    )
+    if blok:
+        sections.append(f"<b>{ICONS['BLOKIR']} BLOKIR</b>:\n" + "\n".join(result_line(d, "BLOKIR") for d in blok))
+    else:
+        sections.append(f"<b>{ICONS['BLOKIR']} BLOKIR</b>:\n<code>—</code>")
 
     err = g["ERROR"]
     if err:
-        sections.append(
-            f"<b>{ICONS['ERROR']} ERROR</b>:\n"
-            + "\n".join(result_line(d, "ERROR") for d in err)
-        )
+        sections.append(f"<b>{ICONS['ERROR']} ERROR</b>:\n" + "\n".join(result_line(d, "ERROR") for d in err))
 
     if show_aman:
         aman = g["AMAN"]
-        sections.append(
-            f"<b>{ICONS['AMAN']} AMAN</b>:\n"
-            + ("\n".join(result_line(d, "AMAN") for d in aman) if aman else "<code>—</code>")
-        )
+        if aman:
+            sections.append(f"<b>{ICONS['AMAN']} AMAN</b>:\n" + "\n".join(result_line(d, "AMAN") for d in aman))
+        else:
+            sections.append(f"<b>{ICONS['AMAN']} AMAN</b>:\n<code>—</code>")
 
     body = "\n\n".join(sections)
     tail = "\n\n" + recap(rows)
     return f"{head}\n\n{body}{tail}"
 
 
-# ================== ALERT ==================
-async def notify_admins_blocked(
-    rows: List[Tuple[str, str]],
-    only_new: bool = True,
-    source: str = "manual",
-) -> None:
+# ================== ALERT NAWALA ==================
+async def notify_admins_blocked(rows: List[Tuple[str, str]], only_new: bool = True, source: str = "manual"):
     if ALERT_ONLY_FROM_AUTO and source != "auto":
         return
     if not rows:
@@ -575,14 +489,16 @@ async def notify_admins_blocked(
     blocked_now = [d for d, s in rows if s == "BLOKIR"]
 
     if only_new:
-        targets = [
-            d for d in blocked_now
-            if (cache.get(d) or "").upper() != "BLOKIR"
-        ]
-        title = "🔥 TRUSTPOSITIF (Baru Terblokir)"
+        newly_blocked = []
+        for d in blocked_now:
+            prev = (cache.get(d) or "").upper()
+            if prev != "BLOKIR":
+                newly_blocked.append(d)
+        targets = newly_blocked
+        title = "🔥 NAWALA (Baru Terblokir)"
     else:
         targets = blocked_now
-        title   = "🟥 TRUSTPOSITIF (Blokir Terdeteksi)"
+        title = "🟥 NAWALA (Blokir Terdeteksi)"
 
     cache.update({d: latest[d] for d in latest})
     save_status_cache(cache)
@@ -594,7 +510,7 @@ async def notify_admins_blocked(
     alert_text = (
         f"🚨 <b>{title}</b>\n"
         f"🗓 {now_wib()}\n\n"
-        f"Domain berikut masuk <b>BLOKIR</b>:\n{lines}\n\n"
+        f"Domain berikut masuk <b>BLOKIR / NAWALA</b>:\n{lines}\n\n"
         f"⚠️ Rekomendasi: segera redirect/replace ke link mirror baru."
     )
 
@@ -605,64 +521,52 @@ async def notify_admins_blocked(
             logging.error(f"Gagal kirim alert ke admin {admin_id}: {e}")
 
 
-# ================== SENDER ==================
-async def send_single_report_message(
-    chat_id: int, rows: List[Tuple[str, str]], title: str
-) -> None:
-    text = _compose_message(rows, title)
-    await send_long_message(chat_id, text)
-
-
-async def send_long_message(chat_id: int, text: str, limit: int = 4096) -> None:
-    MAX = limit - 64
-    if len(text) <= MAX:
-        await bot.send_message(chat_id, text, disable_web_page_preview=True)
-        return
+# ================== SENDER (auto-split long msg) ==================
+async def send_long_message(chat_id: int, text: str, limit: int = 4096):
+    max_len = limit - 64
+    if len(text) <= max_len:
+        return await bot.send_message(chat_id, text, disable_web_page_preview=True)
 
     lines = text.splitlines(keepends=True)
-    buf  = ""
+    buf = ""
     part = 1
     for ln in lines:
-        if len(buf) + len(ln) > MAX:
-            await bot.send_message(
-                chat_id,
-                buf + "\n<code>⤵️ lanjut...</code>",
-                disable_web_page_preview=True,
-            )
-            buf = (
-                f"┏━━━ 🛰 <b>Laporan (lanjutan #{part})</b>\n"
-                f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            )
+        if len(buf) + len(ln) > max_len:
+            if buf.strip():
+                await bot.send_message(chat_id, buf, disable_web_page_preview=True)
+            buf = f"┏━━━ 🛰 <b>Laporan (lanjutan #{part})</b>\n┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             part += 1
         buf += ln
+
     if buf.strip():
         await bot.send_message(chat_id, buf, disable_web_page_preview=True)
 
 
+async def send_single_report_message(chat_id, rows: List[Tuple[str, str]], title: str):
+    text = _compose_message(rows, title)
+    await send_long_message(chat_id, text)
+
+
 # ================== AUTO LOOP ==================
-async def auto_loop() -> None:
+async def auto_loop():
     global auto_task
     logging.info("Auto-cek started")
     try:
         while not shutdown_flag and state.get("auto_interval", 0) > 0:
-            interval_sec = max(60, state["auto_interval"] * 60)
             if not domains:
-                await asyncio.sleep(interval_sec)
+                await asyncio.sleep(max(5, state["auto_interval"] * 60))
                 continue
+
             try:
                 rows = await cek_semua_dalam_batch(domains)
                 await notify_admins_blocked(rows, only_new=True, source="auto")
                 target = state.get("target_chat")
                 if target:
-                    await send_single_report_message(
-                        target, rows,
-                        title=f"Auto Report / {state['auto_interval']} Menit"
-                    )
-            except asyncio.CancelledError:
-                raise
+                    await send_single_report_message(target, rows, title=f"Auto Report / {state['auto_interval']} Menit")
             except Exception as e:
                 logging.error(f"Auto-cek error: {e}")
-            await asyncio.sleep(interval_sec)
+
+            await asyncio.sleep(max(5, state["auto_interval"] * 60))
     except asyncio.CancelledError:
         pass
     finally:
@@ -670,34 +574,31 @@ async def auto_loop() -> None:
         auto_task = None
 
 
-def start_auto() -> None:
+def start_auto():
     global auto_task
     if auto_task and not auto_task.done():
         return
     auto_task = asyncio.create_task(auto_loop())
 
 
-def stop_auto() -> None:
-    global auto_task
+def stop_auto():
     state["auto_interval"] = 0
     save_config()
-    if auto_task and not auto_task.done():
-        auto_task.cancel()
-        logging.info("Auto-cek task cancelled.")
 
 
-# ================== AUTH ==================
+# ================== AUTH HELPER ==================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
 # ================== HANDLERS ==================
 @dp.message_handler(commands=["start"])
-async def start_cmd(message: types.Message) -> None:
+async def start_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return await message.reply("❌ Bot private. Hubungi admin.")
+
     info = (
-        "🛰 <b>TrustPositif Checker</b>\n"
+        "🛰 <b>Nawala Checker</b>\n"
         f"📅 {now_wib()}\n\n"
         "➤ <b>Manual (1 laporan):</b>\n"
         "   /cek domain1.com domain2.com ... → 1 laporan gabungan\n"
@@ -714,22 +615,20 @@ async def start_cmd(message: types.Message) -> None:
         "• <code>/cekall</code>\n"
         "• <code>/cekfull ...</code> (BLOKIR dulu, tombol untuk AMAN)\n\n"
         "Ikon: ✅ AMAN • 🟥 BLOKIR • 🟨 ERROR\n"
-        "Sumber: <b>TrustPositif</b> (API + fallback HTML)"
+        "Catatan: UI baru nawala.in menampilkan badge <b>Blocked</b> / <b>Aman</b>."
     )
     await message.reply(info)
 
 
-async def process_and_reply_single(chat_id: int, inputs: List[str]) -> None:
-    seen: set = set()
-    cleaned: List[str] = []
-    for item in inputs:
-        if not item.strip():
-            continue
+async def process_and_reply_single(chat_id, inputs: List[str]):
+    raw = [x for x in inputs if x.strip()]
+    cleaned = []
+    seen = set()
+    for item in raw:
         d = clean_domain(item)
         if looks_like_domain(d) and d not in seen:
             cleaned.append(d)
             seen.add(d)
-
     if not cleaned:
         return await bot.send_message(chat_id, "⚠️ Tidak ada domain valid.")
 
@@ -739,7 +638,7 @@ async def process_and_reply_single(chat_id: int, inputs: List[str]) -> None:
 
 
 @dp.message_handler(commands=["cek"])
-async def cek_cmd(message: types.Message) -> None:
+async def cek_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     parts = [p for p in message.get_args().split() if p.strip()]
@@ -748,35 +647,35 @@ async def cek_cmd(message: types.Message) -> None:
     try:
         await process_and_reply_single(message.chat.id, parts)
     except Exception as e:
-        await message.reply(f"⚠ Gagal cek: <code>{escape(str(e))}</code>")
+        await message.reply(f"⚠ Gagal cek: <code>{e}</code>")
 
 
 @dp.message_handler(content_types=["text"])
-async def paste_list(message: types.Message) -> None:
+async def paste_list(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     text = (message.text or "").strip()
     if not text or text.startswith("/"):
         return
-    raw_items: List[str] = []
+    raw_items = []
     for line in text.splitlines():
         raw_items.extend(line.split())
     try:
         await process_and_reply_single(message.chat.id, raw_items)
     except Exception as e:
-        await message.reply(f"⚠ Gagal cek: <code>{escape(str(e))}</code>")
+        await message.reply(f"⚠ Gagal cek: <code>{e}</code>")
 
 
 @dp.message_handler(commands=["cekfull"])
-async def cekfull_cmd(message: types.Message) -> None:
+async def cekfull_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     parts = [p for p in message.get_args().split() if p.strip()]
     if not parts:
         return await message.reply("Format: <code>/cekfull domain1.com domain2.com ...</code>")
 
-    seen: set = set()
-    cleaned: List[str] = []
+    cleaned = []
+    seen = set()
     for item in parts:
         d = clean_domain(item)
         if looks_like_domain(d) and d not in seen:
@@ -786,67 +685,54 @@ async def cekfull_cmd(message: types.Message) -> None:
         return await message.reply("⚠️ Tidak ada domain valid.")
 
     try:
-        rows  = await cek_semua_dalam_batch(cleaned)
+        rows = await cek_semua_dalam_batch(cleaned)
         token = uuid.uuid4().hex
-        _purge_old_reports()
-        REPORT_STORE[token] = {"rows": rows, "ts": time.time()}
+        REPORT_STORE[token] = rows
 
-        text = _compose_message_filtered(
-            rows,
-            title=f"Hasil Cek (BLOKIR dulu) • {len(cleaned)} domain",
-            show_aman=False,
-        )
+        text = _compose_message_filtered(rows, title=f"Hasil Cek (BLOKIR dulu) • {len(cleaned)} domain", show_aman=False)
         kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton(
-            "Tampilkan AMAN (✅)", callback_data=f"show_aman:{token}"
-        ))
+        kb.add(types.InlineKeyboardButton("Tampilkan AMAN (✅)", callback_data=f"show_aman:{token}"))
         await send_long_message(message.chat.id, text)
-        await bot.send_message(
-            message.chat.id,
-            "Klik tombol di bawah untuk menampilkan AMAN:",
-            reply_markup=kb,
-        )
+        await bot.send_message(message.chat.id, "Klik tombol di bawah untuk menampilkan AMAN:", reply_markup=kb)
     except Exception as e:
-        await message.reply(f"⚠ Gagal cek: <code>{escape(str(e))}</code>")
+        await message.reply(f"⚠ Gagal cek: <code>{e}</code>")
 
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("show_aman:"))
-async def on_show_aman(cb: types.CallbackQuery) -> None:
+async def on_show_aman(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Admin only", show_alert=True)
     token = cb.data.split(":", 1)[1]
-    entry = REPORT_STORE.get(token)
-    if not entry:
-        return await cb.answer(
-            "Data sudah kedaluwarsa. Jalankan /cekfull lagi.", show_alert=True
-        )
-    rows = entry["rows"]
+    rows = REPORT_STORE.get(token)
+    if not rows:
+        return await cb.answer("Data sudah kedaluwarsa. Jalankan /cekfull lagi.", show_alert=True)
     text = _compose_message_filtered(rows, title="Bagian AMAN", show_aman=True)
     await send_long_message(cb.message.chat.id, text)
     await cb.answer("Bagian AMAN ditampilkan.")
 
 
 @dp.message_handler(content_types=["document"])
-async def txt_upload_auto_mode(message: types.Message) -> None:
+async def txt_upload_auto_mode(message: types.Message):
     if not is_admin(message.from_user.id):
         return
 
-    doc   = message.document
+    doc = message.document
     fname = (doc.file_name or "").lower()
     if not fname.endswith(".txt"):
         return await message.reply("Kirim file .txt ya (satu domain per baris).")
 
     try:
-        file     = await bot.get_file(doc.file_id)
+        file = await bot.get_file(doc.file_id)
         file_obj = await bot.download_file(file.file_path)
-        content  = file_obj.read().decode("utf-8", errors="ignore")
+        content = file_obj.read().decode("utf-8", errors="ignore")
     except Exception as e:
-        return await message.reply(f"⚠️ Gagal baca file: <code>{escape(str(e))}</code>")
+        return await message.reply(f"⚠️ Gagal baca file: <code>{e}</code>")
 
-    seen: set = set()
-    new_domains: List[str] = []
-    for line in content.splitlines():
-        d = clean_domain(line.strip())
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    new_domains = []
+    seen = set()
+    for item in lines:
+        d = clean_domain(item)
         if looks_like_domain(d) and d not in seen:
             new_domains.append(d)
             seen.add(d)
@@ -873,11 +759,12 @@ async def txt_upload_auto_mode(message: types.Message) -> None:
         await send_single_report_message(message.chat.id, rows, title="Cek Awal (Replace TXT)")
         await notify_admins_blocked(rows, only_new=True, source="auto")
     except Exception as e:
-        return await message.reply(f"⚠ Gagal cek awal: <code>{escape(str(e))}</code>")
+        return await message.reply(f"⚠ Gagal cek awal: <code>{e}</code>")
 
+    added = len(domains)
     await message.reply(
         f"🧹 Daftar lama: <b>{before_total}</b> → <b>diganti</b>\n"
-        f"✅ Daftar baru tersimpan: <b>{len(domains)}</b>\n"
+        f"✅ Daftar baru tersimpan: <b>{added}</b>\n"
         f"⏱ Auto-cek: tiap <b>{state['auto_interval']} menit</b> → <b>{state['target_chat']}</b>\n"
         "Format laporan: <b>pesan saja</b> (tanpa lampiran file)"
     )
@@ -889,31 +776,25 @@ def parse_target(s: str):
     if s.startswith("@"):
         return s
     try:
-        v = int(s)
-        return v
-    except ValueError:
-        return None  # tolak input tidak valid
+        return int(s)
+    except Exception:
+        return s
 
 
 @dp.message_handler(commands=["setgroup"])
-async def setgroup_cmd(message: types.Message) -> None:
+async def setgroup_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     arg = message.get_args().strip()
     if not arg:
-        return await message.reply(
-            "Format: <code>/setgroup @username</code> atau <code>/setgroup -1001234567890</code>"
-        )
-    target = parse_target(arg)
-    if target is None:
-        return await message.reply("⚠️ Format target tidak valid. Gunakan @username atau ID numerik.")
-    state["target_chat"] = target
+        return await message.reply("Format: <code>/setgroup @username</code> atau <code>/setgroup -1001234567890</code>")
+    state["target_chat"] = parse_target(arg)
     save_config()
     await message.reply(f"✅ Target grup/channel diset ke: <b>{state['target_chat']}</b>")
 
 
 @dp.message_handler(commands=["add"])
-async def add_cmd(message: types.Message) -> None:
+async def add_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     parts = [clean_domain(p) for p in message.get_args().split() if p.strip()]
@@ -921,25 +802,25 @@ async def add_cmd(message: types.Message) -> None:
     if not parts:
         return await message.reply("Format: <code>/add domain1.com domain2.com ...</code>")
     global domains
-    before  = len(domains)
+    before = len(domains)
     domains = sorted(set(domains + parts))
     save_domains()
     await message.reply(f"✅ Ditambah: {len(domains) - before} | Total: {len(domains)}")
 
 
 @dp.message_handler(commands=["list"])
-async def list_cmd(message: types.Message) -> None:
+async def list_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     if not domains:
         return await message.reply("📂 Daftar kosong. Tambah via <code>/add</code> atau kirim teks/.txt.")
     preview = "\n".join(f"• {d}" for d in domains[:50])
-    more    = f"\n… +{len(domains) - 50} lagi" if len(domains) > 50 else ""
+    more = f"\n… +{len(domains) - 50} lagi" if len(domains) > 50 else ""
     await message.reply(f"📂 <b>Daftar Auto-Cek ({len(domains)})</b>:\n{preview}{more}")
 
 
 @dp.message_handler(commands=["clearlist"])
-async def clearlist_cmd(message: types.Message) -> None:
+async def clearlist_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     domains.clear()
@@ -948,7 +829,7 @@ async def clearlist_cmd(message: types.Message) -> None:
 
 
 @dp.message_handler(commands=["auto"])
-async def auto_cmd(message: types.Message) -> None:
+async def auto_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     arg = message.get_args().strip()
@@ -962,14 +843,11 @@ async def auto_cmd(message: types.Message) -> None:
     state["auto_interval"] = menit
     save_config()
     start_auto()
-    await message.reply(
-        f"✅ Auto-cek ON tiap <b>{menit} menit</b> ke <b>{state['target_chat']}</b>.\n"
-        "Tip: <code>/stopauto</code> untuk matikan."
-    )
+    await message.reply(f"✅ Auto-cek ON tiap <b>{menit} menit</b> ke <b>{state['target_chat']}</b>.\nTip: <code>/stopauto</code> untuk matikan.")
 
 
 @dp.message_handler(commands=["stopauto"])
-async def stopauto_cmd(message: types.Message) -> None:
+async def stopauto_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     stop_auto()
@@ -977,7 +855,7 @@ async def stopauto_cmd(message: types.Message) -> None:
 
 
 @dp.message_handler(commands=["cekall"])
-async def cekall_cmd(message: types.Message) -> None:
+async def cekall_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     if not domains:
@@ -987,16 +865,16 @@ async def cekall_cmd(message: types.Message) -> None:
 
 
 # ================== LIFECYCLE ==================
-async def on_startup(_) -> None:
+async def on_startup(_):
     load_config()
     load_domains()
-    load_status_cache()
+    _ = load_status_cache()
     if state.get("auto_interval", 0) > 0 and state.get("target_chat"):
         start_auto()
     logging.info("Bot started. Config: %s | domains: %d", state, len(domains))
 
 
-async def on_shutdown(_) -> None:
+async def on_shutdown(_):
     global shutdown_flag
     shutdown_flag = True
     if auto_task and not auto_task.done():
@@ -1013,10 +891,5 @@ async def on_shutdown(_) -> None:
 
 # ================== RUN ==================
 if __name__ == "__main__":
-    logging.info("Starting TrustPositif Checker…")
-    executor.start_polling(
-        dp,
-        skip_updates=True,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-    )
+    logging.info("Starting Nawala Checker…")
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
