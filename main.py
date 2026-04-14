@@ -13,12 +13,21 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from bs4 import BeautifulSoup
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 # ================== CONFIG ==================
-# Simpan token di environment variable BOT_TOKEN.
-# Jangan hardcode token bot di file.
 TOKEN = os.getenv("BOT_TOKEN", "")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN belum diset. Isi environment variable BOT_TOKEN dulu.")
+
 ADMIN_IDS = [5397964203, 6918801560, 7230912053, 5780186213, 6670157806]
-NAWALA_URL = "https://www.nawala.asia/"
+
+TRUST_URL = "https://trustpositif.live/"
+CHECK_ACTION = "https://trustpositif.live/?index"
 
 WIB = pytz.timezone("Asia/Jakarta")
 
@@ -32,9 +41,6 @@ BATCH_SIZE = 30
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # ================== BOT CORE ==================
-if not TOKEN:
-    logging.warning("BOT_TOKEN belum diset. Bot tidak akan bisa jalan sampai token diisi.")
-
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
@@ -86,7 +92,7 @@ def load_domains():
             logging.error(f"Gagal load domains: {e}")
 
 
-# ================== STATUS CACHE (persist) ==================
+# ================== STATUS CACHE ==================
 def load_status_cache() -> Dict[str, str]:
     if os.path.exists(STATUS_CACHE_FILE):
         try:
@@ -130,28 +136,16 @@ def looks_like_domain(s: str) -> bool:
 
 
 def map_status_text(text: str) -> str:
-    """
-    Support UI lama dan baru.
-    Return: AMAN | BLOKIR | ERROR
-    """
     t = (text or "").strip().lower()
     t = _re.sub(r"\s+", " ", t)
 
     if not t:
         return "ERROR"
 
-    if "tidak ada" in t:
-        return "AMAN"
-    if "not blocked" in t or "notblock" in t:
+    if any(k in t for k in ["aman", "active", "safe", "clean", "not blocked", "allowed"]):
         return "AMAN"
 
-    if "blocked" in t or "blokir" in t or "nawala" in t:
-        return "BLOKIR"
-    if "aman" in t or "safe" in t or "clean" in t:
-        return "AMAN"
-
-    # Fallback lama: teks yang mengandung kata "ada" biasanya berarti terblokir.
-    if _re.search(r"\bada\b", t):
+    if any(k in t for k in ["terblokir", "blocked", "blokir", "nawala"]):
         return "BLOKIR"
 
     return "ERROR"
@@ -177,158 +171,64 @@ def recap(rows: List[Tuple[str, str]]) -> str:
     )
 
 
-def chunked(seq: List[str], n: int) -> List[List[str]]:
-    return [seq[i : i + n] for i in range(0, len(seq), n)]
-
-
-# ================== PARSER HTML NAWALA ==================
-def _parse_nawala_html_for_rows(html: str, requested_domains: List[str]) -> List[Tuple[str, str]]:
-    """
-    Parser tahan perubahan UI:
-    - Cari tabel hasil yang headernya mengandung Domain + Status/Keterangan
-    - Ambil badge/text status
-    - Fallback regex sekitar domain
-    """
+# ================== PARSER HTML ==================
+def _parse_trust_html_for_rows(html: str, requested_domains: List[str]) -> List[Tuple[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
     found_map: Dict[str, str] = {}
 
-    def norm(s: str) -> str:
-        return (s or "").strip().lower()
+    def detect_status(text: str) -> str:
+        t = (text or "").strip().lower()
+        t = _re.sub(r"\s+", " ", t)
+        if any(k in t for k in ["aman", "active", "safe", "clean", "not blocked", "allowed"]):
+            return "AMAN"
+        if any(k in t for k in ["terblokir", "blocked", "blokir", "nawala"]):
+            return "BLOKIR"
+        return "ERROR"
 
-    # 1) Table-based extraction
+    # 1) Tabel hasil
     for table in soup.find_all("table"):
-        headers: List[str] = []
-        thead = table.find("thead")
-        if thead:
-            headers = [th.get_text(" ", strip=True) for th in thead.find_all(["th", "td"])]
-        else:
-            tr0 = table.find("tr")
-            if tr0:
-                headers = [c.get_text(" ", strip=True) for c in tr0.find_all(["th", "td"])]
-
-        if not headers:
+        rows = table.find_all("tr")
+        if not rows:
             continue
 
-        hnorm = [norm(h) for h in headers]
-        if not any("domain" in h or "situs" in h or "website" in h for h in hnorm):
-            continue
-        if not any("status" in h or "keterangan" in h for h in hnorm):
-            continue
+        for tr in rows:
+            tds = tr.find_all("td")
+            if len(tds) < 2:
+                continue
 
-        try:
-            idx_dom = next(i for i, h in enumerate(hnorm) if "domain" in h or "situs" in h or "website" in h)
-        except StopIteration:
-            idx_dom = 0
-        try:
-            idx_st = next(i for i, h in enumerate(hnorm) if "status" in h or "keterangan" in h)
-        except StopIteration:
-            idx_st = min(1, len(headers) - 1)
+            dom = clean_domain(tds[0].get_text(" ", strip=True))
+            if not looks_like_domain(dom):
+                continue
 
-        tbodies = table.find_all("tbody") or [table]
-        for tbody in tbodies:
-            for tr in tbody.find_all("tr"):
-                tds = tr.find_all("td")
-                if not tds or len(tds) <= max(idx_dom, idx_st):
-                    continue
+            row_text = " ".join(td.get_text(" ", strip=True) for td in tds)
+            status = detect_status(row_text)
 
-                dom = clean_domain(tds[idx_dom].get_text(" ", strip=True))
-                if not looks_like_domain(dom):
-                    continue
+            if dom not in found_map or found_map[dom] == "ERROR":
+                found_map[dom] = status
 
-                status_cell = tds[idx_st]
-                badge_text = ""
-                badge = status_cell.find(class_=_re.compile(r"badge", _re.I))
-                if badge:
-                    badge_text = badge.get_text(" ", strip=True)
-                st_text = badge_text or status_cell.get_text(" ", strip=True)
-                found_map[dom] = map_status_text(st_text)
-
-    # 2) Direct text fallback near requested domain
+    # 2) Fallback teks mentah
     html_one = " ".join(html.split())
     for d in requested_domains:
         if d in found_map:
             continue
-        pat = _re.compile(
-            rf"{_re.escape(d)}.*?(blocked|aman|tidak\s*ada|ada)",
+        m = _re.search(
+            rf"{_re.escape(d)}.*?(aman|active|terblokir|blocked)",
+            html_one,
             _re.IGNORECASE | _re.DOTALL,
         )
-        m = pat.search(html_one)
         if m:
-            found_map[d] = map_status_text(m.group(1))
+            found_map[d] = detect_status(m.group(1))
 
-    # 3) Output urut sesuai input, kalau tidak ketemu => ERROR
-    out: List[Tuple[str, str]] = []
-    for d in requested_domains:
-        out.append((d, found_map.get(d, "ERROR")))
-    return out
+    return [(d, found_map.get(d, "ERROR")) for d in requested_domains]
 
 
 # ================== REQUEST HELPER ==================
-def _extract_form_meta(html: str) -> Dict[str, str]:
-    """
-    Coba ambil action, method, dan field domain dari form utama.
-    Kalau struktur website berubah, bot tetap punya fallback.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    form = None
-
-    # Pilih form yang paling mungkin berhubungan dengan domain checker
-    for candidate in soup.find_all("form"):
-        text = candidate.get_text(" ", strip=True).lower()
-        attrs = " ".join(str(v) for v in candidate.attrs.values()).lower()
-        if any(k in text or k in attrs for k in ["domain", "nawala", "cek", "check", "filter"]):
-            form = candidate
-            break
-
-    if form is None:
-        form = soup.find("form")
-
-    meta = {"action": NAWALA_URL, "method": "post", "field": "domains"}
-    if not form:
-        return meta
-
-    action = form.get("action") or NAWALA_URL
-    if action.startswith("/"):
-        action = "https://www.nawala.asia" + action
-    meta["action"] = action
-    meta["method"] = (form.get("method") or "post").strip().lower() or "post"
-
-    # cari textarea / input yang paling mungkin jadi field domain
-    candidates = []
-    for el in form.find_all(["textarea", "input"]):
-        name = (el.get("name") or "").strip()
-        if not name:
-            continue
-        placeholder = (el.get("placeholder") or "").lower()
-        el_id = (el.get("id") or "").lower()
-        cls = " ".join(el.get("class") or []).lower()
-        label_text = " ".join([
-            placeholder,
-            el_id,
-            cls,
-            name.lower(),
-        ])
-        score = 0
-        for key in ["domain", "domains", "url", "site", "situs", "website", "list"]:
-            if key in label_text:
-                score += 2
-        if el.name == "textarea":
-            score += 1
-        candidates.append((score, name, el.name))
-
-    if candidates:
-        candidates.sort(key=lambda x: (x[0], x[2] == "input"), reverse=True)
-        meta["field"] = candidates[0][1]
-
-    return meta
-
-
 async def _fetch_home_html(session: aiohttp.ClientSession) -> str:
-    async with session.get(NAWALA_URL, timeout=30) as r:
+    async with session.get(TRUST_URL, timeout=30) as r:
         return await r.text()
 
 
-# ================== CEK KE NAWALA.IN ==================
+# ================== CEK KE TRUSTPOSITIF.LIVE ==================
 async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
     ds = [clean_domain(d) for d in domains_in if looks_like_domain(d)]
     seen = set()
@@ -346,8 +246,8 @@ async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": NAWALA_URL,
-        "Origin": "https://www.nawala.asia",
+        "Referer": TRUST_URL,
+        "Origin": "https://trustpositif.live",
     }
 
     timeout = aiohttp.ClientTimeout(total=45)
@@ -357,7 +257,6 @@ async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
         except Exception:
             home_html = ""
 
-        form_meta = _extract_form_meta(home_html) if home_html else {"action": NAWALA_URL, "method": "post", "field": "domains"}
         hidden = {}
         if home_html:
             soup = BeautifulSoup(home_html, "html.parser")
@@ -367,24 +266,17 @@ async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
                 if tp == "hidden" and name:
                     hidden[name] = inp.get("value") or ""
 
-        payload = {**hidden, form_meta["field"]: "\n".join(uniq)}
-        action = form_meta["action"] or NAWALA_URL
-        method = form_meta["method"].lower()
+        payload = {**hidden, "domains": "\n".join(uniq)}
 
         try:
-            if method == "get":
-                async with session.get(action, params=payload, allow_redirects=True) as r:
-                    text = await r.text()
-            else:
-                async with session.post(action, data=payload, allow_redirects=True) as r:
-                    text = await r.text()
+            async with session.post(CHECK_ACTION, data=payload, allow_redirects=True) as r:
+                text = await r.text()
         except Exception:
-            # Fallback: kirim ke homepage langsung kalau action berubah
-            async with session.post(NAWALA_URL, data=payload, allow_redirects=True) as r:
+            # fallback ke home kalau endpoint berubah
+            async with session.post(TRUST_URL, params={"index": ""}, data=payload, allow_redirects=True) as r:
                 text = await r.text()
 
-    rows = _parse_nawala_html_for_rows(text, uniq)
-    return rows
+    return _parse_trust_html_for_rows(text, uniq)
 
 
 async def cek_semua_dalam_batch(ds: List[str]) -> List[Tuple[str, str]]:
@@ -477,7 +369,7 @@ def _compose_message_filtered(rows: List[Tuple[str, str]], title: str, show_aman
     return f"{head}\n\n{body}{tail}"
 
 
-# ================== ALERT NAWALA ==================
+# ================== ALERT ==================
 async def notify_admins_blocked(rows: List[Tuple[str, str]], only_new: bool = True, source: str = "manual"):
     if ALERT_ONLY_FROM_AUTO and source != "auto":
         return
@@ -495,10 +387,10 @@ async def notify_admins_blocked(rows: List[Tuple[str, str]], only_new: bool = Tr
             if prev != "BLOKIR":
                 newly_blocked.append(d)
         targets = newly_blocked
-        title = "🔥 NAWALA (Baru Terblokir)"
+        title = "🔥 TRUST POSITIF (Baru Terblokir)"
     else:
         targets = blocked_now
-        title = "🟥 NAWALA (Blokir Terdeteksi)"
+        title = "🟥 TRUST POSITIF (Blokir Terdeteksi)"
 
     cache.update({d: latest[d] for d in latest})
     save_status_cache(cache)
@@ -510,7 +402,7 @@ async def notify_admins_blocked(rows: List[Tuple[str, str]], only_new: bool = Tr
     alert_text = (
         f"🚨 <b>{title}</b>\n"
         f"🗓 {now_wib()}\n\n"
-        f"Domain berikut masuk <b>BLOKIR / NAWALA</b>:\n{lines}\n\n"
+        f"Domain berikut masuk <b>BLOKIR / TERBLOKIR</b>:\n{lines}\n\n"
         f"⚠️ Rekomendasi: segera redirect/replace ke link mirror baru."
     )
 
@@ -521,7 +413,7 @@ async def notify_admins_blocked(rows: List[Tuple[str, str]], only_new: bool = Tr
             logging.error(f"Gagal kirim alert ke admin {admin_id}: {e}")
 
 
-# ================== SENDER (auto-split long msg) ==================
+# ================== SENDER ==================
 async def send_long_message(chat_id: int, text: str, limit: int = 4096):
     max_len = limit - 64
     if len(text) <= max_len:
@@ -586,7 +478,7 @@ def stop_auto():
     save_config()
 
 
-# ================== AUTH HELPER ==================
+# ================== AUTH ==================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -598,7 +490,7 @@ async def start_cmd(message: types.Message):
         return await message.reply("❌ Bot private. Hubungi admin.")
 
     info = (
-        "🛰 <b>Nawala Checker</b>\n"
+        "🛰 <b>Trust Positif Checker</b>\n"
         f"📅 {now_wib()}\n\n"
         "➤ <b>Manual (1 laporan):</b>\n"
         "   /cek domain1.com domain2.com ... → 1 laporan gabungan\n"
@@ -615,7 +507,7 @@ async def start_cmd(message: types.Message):
         "• <code>/cekall</code>\n"
         "• <code>/cekfull ...</code> (BLOKIR dulu, tombol untuk AMAN)\n\n"
         "Ikon: ✅ AMAN • 🟥 BLOKIR • 🟨 ERROR\n"
-        "Catatan: NawalaAsia menampilkan status <b>Active</b> / <b>Blocked</b> pada kolom <b>Nawala Network</b>."
+        "Catatan: TrustPositif menampilkan status <b>Aman</b> / <b>Terblokir</b>."
     )
     await message.reply(info)
 
@@ -892,5 +784,5 @@ async def on_shutdown(_):
 
 # ================== RUN ==================
 if __name__ == "__main__":
-    logging.info("Starting Nawala Checker…")
+    logging.info("Starting Trust Positif Checker…")
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
