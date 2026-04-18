@@ -1,70 +1,82 @@
 import asyncio
-import json
 import logging
+from datetime import datetime
+import json
 import os
 import re as _re
+from typing import List, Tuple, Dict
 import uuid
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
 
-import aiohttp
 import pytz
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
+import aiohttp
 from bs4 import BeautifulSoup
 
 # ================== CONFIG ==================
-# Simpan token di environment variable BOT_TOKEN.
-# Jangan hardcode token bot di file.
-TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = [5397964203, 6918801560, 7230912053, 5780186213, 6670157806]
-NAWALA_URL = "https://www.nawala.asia/"
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+LOGIN_EMAIL = os.getenv("LOGIN_EMAIL", "").strip().lower()
+LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "").strip()
 
+NAWALA_URL = "https://nawala.in/"
 WIB = pytz.timezone("Asia/Jakarta")
 
 CONFIG_FILE = "config.json"
 DOMAINS_FILE = "domains.txt"
 STATUS_CACHE_FILE = "status_cache.json"
+LOGIN_SESSION_FILE = "login_sessions.json"
+
 ALERT_ONLY_FROM_AUTO = True
 BATCH_SIZE = 30
+
+if not TOKEN:
+    raise ValueError("BOT_TOKEN belum diisi")
+if not ADMIN_IDS:
+    raise ValueError("ADMIN_IDS belum diisi")
+if not LOGIN_EMAIL or not LOGIN_PASSWORD:
+    raise ValueError("LOGIN_EMAIL / LOGIN_PASSWORD belum diisi")
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # ================== BOT CORE ==================
-if not TOKEN:
-    logging.warning("BOT_TOKEN belum diset. Bot tidak akan bisa jalan sampai token diisi.")
-
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
 
 # ================== STATE (persisted) ==================
 state = {"target_chat": None, "auto_interval": 0}
 domains: List[str] = []
-auto_task: Optional[asyncio.Task] = None
+auto_task: asyncio.Task | None = None
 shutdown_flag = False
 
 REPORT_STORE: Dict[str, List[Tuple[str, str]]] = {}
+logged_users = set()
 
 # ================== UTIL PERSIST ==================
-def save_config():
+def save_json(path: str, data):
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.error(f"Gagal save config: {e}")
+        logging.error(f"Gagal save {path}: {e}")
 
+def load_json(path: str, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Gagal load {path}: {e}")
+    return default
+
+def save_config():
+    save_json(CONFIG_FILE, state)
 
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    state.update(data)
-        except Exception as e:
-            logging.error(f"Gagal load config: {e}")
-
+    data = load_json(CONFIG_FILE, {})
+    if isinstance(data, dict):
+        state.update(data)
 
 def save_domains():
     try:
@@ -73,7 +85,6 @@ def save_domains():
                 f.write(d + "\n")
     except Exception as e:
         logging.error(f"Gagal save domains: {e}")
-
 
 def load_domains():
     global domains
@@ -85,117 +96,92 @@ def load_domains():
         except Exception as e:
             logging.error(f"Gagal load domains: {e}")
 
-
-# ================== STATUS CACHE (persist) ==================
 def load_status_cache() -> Dict[str, str]:
-    if os.path.exists(STATUS_CACHE_FILE):
-        try:
-            with open(STATUS_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception as e:
-            logging.error(f"Gagal load status cache: {e}")
-    return {}
-
+    data = load_json(STATUS_CACHE_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 def save_status_cache(cache: Dict[str, str]):
-    try:
-        with open(STATUS_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.error(f"Gagal save status cache: {e}")
+    save_json(STATUS_CACHE_FILE, cache)
 
+def save_login_sessions():
+    save_json(LOGIN_SESSION_FILE, list(logged_users))
+
+def load_login_sessions():
+    global logged_users
+    data = load_json(LOGIN_SESSION_FILE, [])
+    try:
+        logged_users = set(int(x) for x in data)
+    except Exception:
+        logged_users = set()
 
 # ================== HELPERS ==================
 ICONS = {"AMAN": "✅", "BLOKIR": "🟥", "ERROR": "🟨"}
 ORDER = ["BLOKIR", "ERROR", "AMAN"]
 DOMAIN_COL_WIDTH = 32
 
-
 def now_wib():
     return datetime.now(WIB).strftime("%d %B %Y • %H:%M WIB")
-
 
 def clean_domain(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("http://", "").replace("https://", "")
     s = s.split("/")[0].split(":")[0]
-    s = s.lstrip("www.")
     return s
-
 
 def looks_like_domain(s: str) -> bool:
     s = clean_domain(s)
     return bool(_re.match(r"^(?!-)[a-z0-9-]{1,63}(?<!-)\.[a-z0-9-]{2,}(?:\.[a-z0-9-]{2,})*$", s))
 
-
 def map_status_text(text: str) -> str:
-    """
-    Support UI lama dan baru.
-    Return: AMAN | BLOKIR | ERROR
-    """
     t = (text or "").strip().lower()
     t = _re.sub(r"\s+", " ", t)
 
-    if not t:
-        return "ERROR"
-
     if "tidak ada" in t:
         return "AMAN"
-    if "not blocked" in t or "notblock" in t:
-        return "AMAN"
-
     if "blocked" in t or "blokir" in t or "nawala" in t:
         return "BLOKIR"
-    if "aman" in t or "safe" in t or "clean" in t:
+    if " aman" in f" {t}" or "safe" in t or "clean" in t or "not blocked" in t:
         return "AMAN"
-
-    # Fallback lama: teks yang mengandung kata "ada" biasanya berarti terblokir.
-    if _re.search(r"\bada\b", t):
+    if " ada" in f" {t}":
         return "BLOKIR"
 
     return "ERROR"
 
-
 def _pad_domain(d: str, width: int = DOMAIN_COL_WIDTH) -> str:
     return (d[: width - 1] + "…") if len(d) > width else d.ljust(width)
 
-
 def result_line(domain: str, status: str) -> str:
     icon = ICONS.get(status, "🟨")
-    return f"<code>{icon} {_pad_domain(domain)} | {status}</code>"
-
+    label = "Aman" if status == "AMAN" else "Blokir" if status == "BLOKIR" else "Error"
+    return f"<code>{icon} {_pad_domain(domain)} | {label}</code>"
 
 def recap(rows: List[Tuple[str, str]]) -> str:
     total = len(rows)
     aman = sum(1 for _, s in rows if s == "AMAN")
     blok = sum(1 for _, s in rows if s == "BLOKIR")
     err = total - aman - blok
-    return (
-        f"🧮 <b>Rekap:</b> {total} domain • {ICONS['AMAN']} Aman: {aman} • "
-        f"{ICONS['BLOKIR']} Blokir: {blok} • {ICONS['ERROR']} Error: {err}"
-    )
+    return f"🧮 <b>Rekap:</b> {total} domain • {ICONS['AMAN']} Aman: {aman} • {ICONS['BLOKIR']} Blokir: {blok} • {ICONS['ERROR']} Error: {err}"
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-def chunked(seq: List[str], n: int) -> List[List[str]]:
-    return [seq[i : i + n] for i in range(0, len(seq), n)]
+def is_logged_in(user_id: int) -> bool:
+    return user_id in logged_users
 
+def can_use_bot(user_id: int) -> bool:
+    return is_admin(user_id) or is_logged_in(user_id)
+
+def auth_fail_text() -> str:
+    return "❌ Login dulu pakai <code>/login email password</code>"
 
 # ================== PARSER HTML NAWALA ==================
 def _parse_nawala_html_for_rows(html: str, requested_domains: List[str]) -> List[Tuple[str, str]]:
-    """
-    Parser tahan perubahan UI:
-    - Cari tabel hasil yang headernya mengandung Domain + Status/Keterangan
-    - Ambil badge/text status
-    - Fallback regex sekitar domain
-    """
     soup = BeautifulSoup(html, "html.parser")
     found_map: Dict[str, str] = {}
 
     def norm(s: str) -> str:
         return (s or "").strip().lower()
 
-    # 1) Table-based extraction
     for table in soup.find_all("table"):
         headers: List[str] = []
         thead = table.find("thead")
@@ -219,6 +205,7 @@ def _parse_nawala_html_for_rows(html: str, requested_domains: List[str]) -> List
             idx_dom = next(i for i, h in enumerate(hnorm) if "domain" in h or "situs" in h or "website" in h)
         except StopIteration:
             idx_dom = 0
+
         try:
             idx_st = next(i for i, h in enumerate(hnorm) if "status" in h or "keterangan" in h)
         except StopIteration:
@@ -228,107 +215,59 @@ def _parse_nawala_html_for_rows(html: str, requested_domains: List[str]) -> List
         for tbody in tbodies:
             for tr in tbody.find_all("tr"):
                 tds = tr.find_all("td")
-                if not tds or len(tds) <= max(idx_dom, idx_st):
+                if not tds:
+                    continue
+                if len(tds) <= max(idx_dom, idx_st):
                     continue
 
                 dom = clean_domain(tds[idx_dom].get_text(" ", strip=True))
-                if not looks_like_domain(dom):
-                    continue
-
                 status_cell = tds[idx_st]
+
                 badge_text = ""
                 badge = status_cell.find(class_=_re.compile(r"badge", _re.I))
                 if badge:
                     badge_text = badge.get_text(" ", strip=True)
-                st_text = badge_text or status_cell.get_text(" ", strip=True)
-                found_map[dom] = map_status_text(st_text)
 
-    # 2) Direct text fallback near requested domain
+                st_text = badge_text or status_cell.get_text(" ", strip=True)
+
+                if looks_like_domain(dom):
+                    found_map[dom] = map_status_text(st_text)
+
     html_one = " ".join(html.split())
     for d in requested_domains:
         if d in found_map:
             continue
         pat = _re.compile(
-            rf"{_re.escape(d)}.*?(blocked|aman|tidak\s*ada|ada)",
+            rf"{_re.escape(d)}.*?(blocked|aman|tidak\s*ada|ada|blokir|nawala)",
             _re.IGNORECASE | _re.DOTALL,
         )
         m = pat.search(html_one)
         if m:
             found_map[d] = map_status_text(m.group(1))
 
-    # 3) Output urut sesuai input, kalau tidak ketemu => ERROR
     out: List[Tuple[str, str]] = []
     for d in requested_domains:
         out.append((d, found_map.get(d, "ERROR")))
     return out
 
-
 # ================== REQUEST HELPER ==================
-def _extract_form_meta(html: str) -> Dict[str, str]:
-    """
-    Coba ambil action, method, dan field domain dari form utama.
-    Kalau struktur website berubah, bot tetap punya fallback.
-    """
+async def _fetch_hidden_inputs(session: aiohttp.ClientSession) -> Dict[str, str]:
+    try:
+        async with session.get(NAWALA_URL, timeout=30) as r:
+            html = await r.text()
+    except Exception:
+        return {}
+
     soup = BeautifulSoup(html, "html.parser")
-    form = None
+    data: Dict[str, str] = {}
+    for inp in soup.find_all("input"):
+        tp = (inp.get("type") or "").lower()
+        name = inp.get("name")
+        if tp == "hidden" and name:
+            data[name] = inp.get("value") or ""
+    return data
 
-    # Pilih form yang paling mungkin berhubungan dengan domain checker
-    for candidate in soup.find_all("form"):
-        text = candidate.get_text(" ", strip=True).lower()
-        attrs = " ".join(str(v) for v in candidate.attrs.values()).lower()
-        if any(k in text or k in attrs for k in ["domain", "nawala", "cek", "check", "filter"]):
-            form = candidate
-            break
-
-    if form is None:
-        form = soup.find("form")
-
-    meta = {"action": NAWALA_URL, "method": "post", "field": "domains"}
-    if not form:
-        return meta
-
-    action = form.get("action") or NAWALA_URL
-    if action.startswith("/"):
-        action = "https://www.nawala.asia" + action
-    meta["action"] = action
-    meta["method"] = (form.get("method") or "post").strip().lower() or "post"
-
-    # cari textarea / input yang paling mungkin jadi field domain
-    candidates = []
-    for el in form.find_all(["textarea", "input"]):
-        name = (el.get("name") or "").strip()
-        if not name:
-            continue
-        placeholder = (el.get("placeholder") or "").lower()
-        el_id = (el.get("id") or "").lower()
-        cls = " ".join(el.get("class") or []).lower()
-        label_text = " ".join([
-            placeholder,
-            el_id,
-            cls,
-            name.lower(),
-        ])
-        score = 0
-        for key in ["domain", "domains", "url", "site", "situs", "website", "list"]:
-            if key in label_text:
-                score += 2
-        if el.name == "textarea":
-            score += 1
-        candidates.append((score, name, el.name))
-
-    if candidates:
-        candidates.sort(key=lambda x: (x[0], x[2] == "input"), reverse=True)
-        meta["field"] = candidates[0][1]
-
-    return meta
-
-
-async def _fetch_home_html(session: aiohttp.ClientSession) -> str:
-    async with session.get(NAWALA_URL, timeout=30) as r:
-        return await r.text()
-
-
-# ================== CEK KE NAWALA.IN ==================
+# ================== CEK KE NAWALA ==================
 async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
     ds = [clean_domain(d) for d in domains_in if looks_like_domain(d)]
     seen = set()
@@ -339,6 +278,7 @@ async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
             seen.add(d)
         if len(uniq) >= BATCH_SIZE:
             break
+
     if not uniq:
         return []
 
@@ -347,45 +287,17 @@ async def cek_nawala(domains_in: List[str]) -> List[Tuple[str, str]]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": NAWALA_URL,
-        "Origin": "https://www.nawala.asia",
+        "Origin": "https://nawala.in",
     }
 
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        try:
-            home_html = await _fetch_home_html(session)
-        except Exception:
-            home_html = ""
+    async with aiohttp.ClientSession(headers=headers) as session:
+        hidden = await _fetch_hidden_inputs(session)
+        payload = {**hidden, "domains": "\n".join(uniq)}
 
-        form_meta = _extract_form_meta(home_html) if home_html else {"action": NAWALA_URL, "method": "post", "field": "domains"}
-        hidden = {}
-        if home_html:
-            soup = BeautifulSoup(home_html, "html.parser")
-            for inp in soup.find_all("input"):
-                tp = (inp.get("type") or "").lower()
-                name = inp.get("name")
-                if tp == "hidden" and name:
-                    hidden[name] = inp.get("value") or ""
+        async with session.post(NAWALA_URL, data=payload, timeout=30, allow_redirects=True) as r:
+            text = await r.text()
 
-        payload = {**hidden, form_meta["field"]: "\n".join(uniq)}
-        action = form_meta["action"] or NAWALA_URL
-        method = form_meta["method"].lower()
-
-        try:
-            if method == "get":
-                async with session.get(action, params=payload, allow_redirects=True) as r:
-                    text = await r.text()
-            else:
-                async with session.post(action, data=payload, allow_redirects=True) as r:
-                    text = await r.text()
-        except Exception:
-            # Fallback: kirim ke homepage langsung kalau action berubah
-            async with session.post(NAWALA_URL, data=payload, allow_redirects=True) as r:
-                text = await r.text()
-
-    rows = _parse_nawala_html_for_rows(text, uniq)
-    return rows
-
+    return _parse_nawala_html_for_rows(text, uniq)
 
 async def cek_semua_dalam_batch(ds: List[str]) -> List[Tuple[str, str]]:
     hasil: List[Tuple[str, str]] = []
@@ -413,7 +325,6 @@ async def cek_semua_dalam_batch(ds: List[str]) -> List[Tuple[str, str]]:
 
     return hasil
 
-
 # ================== BUILDER LAPORAN ==================
 def _group_rows(rows: List[Tuple[str, str]]):
     g = {"AMAN": [], "BLOKIR": [], "ERROR": []}
@@ -423,7 +334,6 @@ def _group_rows(rows: List[Tuple[str, str]]):
     for k in g:
         g[k] = sorted(set(g[k]))
     return g
-
 
 def _compose_message(rows: List[Tuple[str, str]], title: str) -> str:
     g = _group_rows(rows)
@@ -444,7 +354,6 @@ def _compose_message(rows: List[Tuple[str, str]], title: str) -> str:
     body = "\n\n".join(sections)
     tail = "\n\n" + recap(rows)
     return f"{head}\n\n{body}{tail}"
-
 
 def _compose_message_filtered(rows: List[Tuple[str, str]], title: str, show_aman: bool = False) -> str:
     g = _group_rows(rows)
@@ -476,8 +385,7 @@ def _compose_message_filtered(rows: List[Tuple[str, str]], title: str, show_aman
     tail = "\n\n" + recap(rows)
     return f"{head}\n\n{body}{tail}"
 
-
-# ================== ALERT NAWALA ==================
+# ================== ALERT ==================
 async def notify_admins_blocked(rows: List[Tuple[str, str]], only_new: bool = True, source: str = "manual"):
     if ALERT_ONLY_FROM_AUTO and source != "auto":
         return
@@ -520,32 +428,27 @@ async def notify_admins_blocked(rows: List[Tuple[str, str]], only_new: bool = Tr
         except Exception as e:
             logging.error(f"Gagal kirim alert ke admin {admin_id}: {e}")
 
+# ================== SENDER ==================
+async def send_single_report_message(chat_id, rows: List[Tuple[str, str]], title: str):
+    text = _compose_message(rows, title)
+    await send_long_message(chat_id, text)
 
-# ================== SENDER (auto-split long msg) ==================
 async def send_long_message(chat_id: int, text: str, limit: int = 4096):
-    max_len = limit - 64
-    if len(text) <= max_len:
+    MAX = limit - 64
+    if len(text) <= MAX:
         return await bot.send_message(chat_id, text, disable_web_page_preview=True)
 
     lines = text.splitlines(keepends=True)
     buf = ""
     part = 1
     for ln in lines:
-        if len(buf) + len(ln) > max_len:
-            if buf.strip():
-                await bot.send_message(chat_id, buf, disable_web_page_preview=True)
+        if len(buf) + len(ln) > MAX:
+            await bot.send_message(chat_id, buf + "\n<code>⤵️ lanjut...</code>", disable_web_page_preview=True)
             buf = f"┏━━━ 🛰 <b>Laporan (lanjutan #{part})</b>\n┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             part += 1
         buf += ln
-
     if buf.strip():
         await bot.send_message(chat_id, buf, disable_web_page_preview=True)
-
-
-async def send_single_report_message(chat_id, rows: List[Tuple[str, str]], title: str):
-    text = _compose_message(rows, title)
-    await send_long_message(chat_id, text)
-
 
 # ================== AUTO LOOP ==================
 async def auto_loop():
@@ -556,7 +459,6 @@ async def auto_loop():
             if not domains:
                 await asyncio.sleep(max(5, state["auto_interval"] * 60))
                 continue
-
             try:
                 rows = await cek_semua_dalam_batch(domains)
                 await notify_admins_blocked(rows, only_new=True, source="auto")
@@ -565,14 +467,10 @@ async def auto_loop():
                     await send_single_report_message(target, rows, title=f"Auto Report / {state['auto_interval']} Menit")
             except Exception as e:
                 logging.error(f"Auto-cek error: {e}")
-
             await asyncio.sleep(max(5, state["auto_interval"] * 60))
-    except asyncio.CancelledError:
-        pass
     finally:
         logging.info("Auto-cek stopped")
         auto_task = None
-
 
 def start_auto():
     global auto_task
@@ -580,55 +478,22 @@ def start_auto():
         return
     auto_task = asyncio.create_task(auto_loop())
 
-
 def stop_auto():
     state["auto_interval"] = 0
     save_config()
 
-
-# ================== AUTH HELPER ==================
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-# ================== HANDLERS ==================
-@dp.message_handler(commands=["start"])
-async def start_cmd(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply("❌ Bot private. Hubungi admin.")
-
-    info = (
-        "🛰 <b>Nawala Checker</b>\n"
-        f"📅 {now_wib()}\n\n"
-        "➤ <b>Manual (1 laporan):</b>\n"
-        "   /cek domain1.com domain2.com ... → 1 laporan gabungan\n"
-        "   Kirim teks daftar domain → 1 laporan gabungan\n\n"
-        "➤ <b>Auto (pakai file .txt satu domain per baris):</b>\n"
-        "   Kirim file .txt → bot GANTI daftar lama dan auto-cek tiap N menit.\n"
-        "   Laporan dikirim <b>pesan saja</b> (tanpa lampiran file).\n\n"
-        "⚙️ <b>Perintah Admin:</b>\n"
-        "• <code>/setgroup</code> @username atau -100ID\n"
-        "• <code>/add</code> domain1.com domain2.com ...\n"
-        "• <code>/list</code> / <code>/clearlist</code>\n"
-        "• <code>/auto 5</code> (cek tiap 5 menit)\n"
-        "• <code>/stopauto</code>\n"
-        "• <code>/cekall</code>\n"
-        "• <code>/cekfull ...</code> (BLOKIR dulu, tombol untuk AMAN)\n\n"
-        "Ikon: ✅ AMAN • 🟥 BLOKIR • 🟨 ERROR\n"
-        "Catatan: NawalaAsia menampilkan status <b>Active</b> / <b>Blocked</b> pada kolom <b>Nawala Network</b>."
-    )
-    await message.reply(info)
-
-
+# ================== CORE CHECK ==================
 async def process_and_reply_single(chat_id, inputs: List[str]):
     raw = [x for x in inputs if x.strip()]
     cleaned = []
     seen = set()
+
     for item in raw:
         d = clean_domain(item)
         if looks_like_domain(d) and d not in seen:
             cleaned.append(d)
             seen.add(d)
+
     if not cleaned:
         return await bot.send_message(chat_id, "⚠️ Tidak ada domain valid.")
 
@@ -636,40 +501,92 @@ async def process_and_reply_single(chat_id, inputs: List[str]):
     text = _compose_message(rows, title=f"Hasil Cek • {len(cleaned)} domain")
     await send_long_message(chat_id, text)
 
+# ================== HANDLERS ==================
+@dp.message_handler(commands=["start"])
+async def start_cmd(message: types.Message):
+    info = (
+        "🛰 <b>Nawala Checker</b>\n"
+        f"📅 {now_wib()}\n\n"
+        "🔐 <b>Login:</b>\n"
+        "• <code>/login email password</code>\n"
+        "• <code>/logout</code>\n\n"
+        "➤ <b>Manual:</b>\n"
+        "• <code>/cek domain1.com domain2.com</code>\n"
+        "• kirim daftar domain biasa\n\n"
+        "➤ <b>Admin only:</b>\n"
+        "• <code>/setgroup @username / -100ID</code>\n"
+        "• <code>/add domain1.com domain2.com</code>\n"
+        "• <code>/list</code>\n"
+        "• <code>/clearlist</code>\n"
+        "• <code>/auto 5</code>\n"
+        "• <code>/stopauto</code>\n"
+        "• <code>/cekall</code>\n"
+        "• <code>/cekfull ...</code>\n"
+        "• upload file .txt\n\n"
+        "Ikon: ✅ Aman • 🟥 Blokir • 🟨 Error"
+    )
+    await message.reply(info)
+
+@dp.message_handler(commands=["login"])
+async def login_cmd(message: types.Message):
+    args = message.get_args().strip().split()
+    if len(args) < 2:
+        return await message.reply("Format: <code>/login email password</code>")
+
+    email = args[0].strip().lower()
+    password = " ".join(args[1:]).strip()
+
+    if email == LOGIN_EMAIL and password == LOGIN_PASSWORD:
+        logged_users.add(message.from_user.id)
+        save_login_sessions()
+        return await message.reply("✅ Login berhasil")
+
+    await message.reply("❌ Email / password salah")
+
+@dp.message_handler(commands=["logout"])
+async def logout_cmd(message: types.Message):
+    if message.from_user.id in logged_users:
+        logged_users.discard(message.from_user.id)
+        save_login_sessions()
+    await message.reply("✅ Logout berhasil")
 
 @dp.message_handler(commands=["cek"])
 async def cek_cmd(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
+    if not can_use_bot(message.from_user.id):
+        return await message.reply(auth_fail_text())
+
     parts = [p for p in message.get_args().split() if p.strip()]
     if not parts:
         return await message.reply("Format: <code>/cek domain1.com domain2.com ...</code>")
+
     try:
         await process_and_reply_single(message.chat.id, parts)
     except Exception as e:
         await message.reply(f"⚠ Gagal cek: <code>{e}</code>")
 
-
 @dp.message_handler(content_types=["text"])
 async def paste_list(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
     text = (message.text or "").strip()
     if not text or text.startswith("/"):
         return
+
+    if not can_use_bot(message.from_user.id):
+        return await message.reply(auth_fail_text())
+
     raw_items = []
     for line in text.splitlines():
         raw_items.extend(line.split())
+
     try:
         await process_and_reply_single(message.chat.id, raw_items)
     except Exception as e:
         await message.reply(f"⚠ Gagal cek: <code>{e}</code>")
 
-
 @dp.message_handler(commands=["cekfull"])
 async def cekfull_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
+
     parts = [p for p in message.get_args().split() if p.strip()]
     if not parts:
         return await message.reply("Format: <code>/cekfull domain1.com domain2.com ...</code>")
@@ -681,6 +598,7 @@ async def cekfull_cmd(message: types.Message):
         if looks_like_domain(d) and d not in seen:
             cleaned.append(d)
             seen.add(d)
+
     if not cleaned:
         return await message.reply("⚠️ Tidak ada domain valid.")
 
@@ -697,24 +615,24 @@ async def cekfull_cmd(message: types.Message):
     except Exception as e:
         await message.reply(f"⚠ Gagal cek: <code>{e}</code>")
 
-
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("show_aman:"))
 async def on_show_aman(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Admin only", show_alert=True)
+
     token = cb.data.split(":", 1)[1]
     rows = REPORT_STORE.get(token)
     if not rows:
         return await cb.answer("Data sudah kedaluwarsa. Jalankan /cekfull lagi.", show_alert=True)
+
     text = _compose_message_filtered(rows, title="Bagian AMAN", show_aman=True)
     await send_long_message(cb.message.chat.id, text)
     await cb.answer("Bagian AMAN ditampilkan.")
 
-
 @dp.message_handler(content_types=["document"])
 async def txt_upload_auto_mode(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
 
     doc = message.document
     fname = (doc.file_name or "").lower()
@@ -731,6 +649,7 @@ async def txt_upload_auto_mode(message: types.Message):
     lines = [l.strip() for l in content.splitlines() if l.strip()]
     new_domains = []
     seen = set()
+
     for item in lines:
         d = clean_domain(item)
         if looks_like_domain(d) and d not in seen:
@@ -769,7 +688,6 @@ async def txt_upload_auto_mode(message: types.Message):
         "Format laporan: <b>pesan saja</b> (tanpa lampiran file)"
     )
 
-
 # ================== MGMT ==================
 def parse_target(s: str):
     s = s.strip()
@@ -780,115 +698,121 @@ def parse_target(s: str):
     except Exception:
         return s
 
-
 @dp.message_handler(commands=["setgroup"])
 async def setgroup_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
+
     arg = message.get_args().strip()
     if not arg:
         return await message.reply("Format: <code>/setgroup @username</code> atau <code>/setgroup -1001234567890</code>")
+
     state["target_chat"] = parse_target(arg)
     save_config()
     await message.reply(f"✅ Target grup/channel diset ke: <b>{state['target_chat']}</b>")
 
-
 @dp.message_handler(commands=["add"])
 async def add_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
+
     parts = [clean_domain(p) for p in message.get_args().split() if p.strip()]
     parts = [p for p in parts if looks_like_domain(p)]
     if not parts:
         return await message.reply("Format: <code>/add domain1.com domain2.com ...</code>")
+
     global domains
     before = len(domains)
     domains = sorted(set(domains + parts))
     save_domains()
     await message.reply(f"✅ Ditambah: {len(domains) - before} | Total: {len(domains)}")
 
-
 @dp.message_handler(commands=["list"])
 async def list_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
+
     if not domains:
-        return await message.reply("📂 Daftar kosong. Tambah via <code>/add</code> atau kirim teks/.txt.")
+        return await message.reply("📂 Daftar kosong. Tambah via <code>/add</code> atau kirim .txt.")
+
     preview = "\n".join(f"• {d}" for d in domains[:50])
     more = f"\n… +{len(domains) - 50} lagi" if len(domains) > 50 else ""
     await message.reply(f"📂 <b>Daftar Auto-Cek ({len(domains)})</b>:\n{preview}{more}")
 
-
 @dp.message_handler(commands=["clearlist"])
 async def clearlist_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
+
     domains.clear()
     save_domains()
     await message.reply("🧽 Daftar domain dibersihkan.")
 
-
 @dp.message_handler(commands=["auto"])
 async def auto_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
+
     arg = message.get_args().strip()
     if not arg.isdigit():
         return await message.reply("Format: <code>/auto 5</code> (menit). Min 1 menit.")
+
     menit = max(1, int(arg))
     if not state.get("target_chat"):
         return await message.reply("Set target dulu pakai <code>/setgroup</code> ya.")
     if not domains:
         return await message.reply("Daftar domain masih kosong. Tambah dulu / kirim .txt.")
+
     state["auto_interval"] = menit
     save_config()
     start_auto()
     await message.reply(f"✅ Auto-cek ON tiap <b>{menit} menit</b> ke <b>{state['target_chat']}</b>.\nTip: <code>/stopauto</code> untuk matikan.")
 
-
 @dp.message_handler(commands=["stopauto"])
 async def stopauto_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
+
     stop_auto()
     await message.reply("🛑 Auto-cek dimatikan.")
-
 
 @dp.message_handler(commands=["cekall"])
 async def cekall_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
-        return
+        return await message.reply("❌ Admin only")
+
     if not domains:
         return await message.reply("📂 Daftar kosong.")
+
     rows = await cek_semua_dalam_batch(domains)
     await send_single_report_message(message.chat.id, rows, title="Cek Semua (Manual)")
 
-
 # ================== LIFECYCLE ==================
 async def on_startup(_):
-    await bot.delete_webhook(drop_pending_updates=True)
     load_config()
     load_domains()
+    load_login_sessions()
     _ = load_status_cache()
+
     if state.get("auto_interval", 0) > 0 and state.get("target_chat"):
         start_auto()
-    logging.info("Bot started. Config: %s | domains: %d", state, len(domains))
 
+    logging.info("Bot started. Config: %s | domains: %d | logged: %d", state, len(domains), len(logged_users))
 
 async def on_shutdown(_):
     global shutdown_flag
     shutdown_flag = True
+    save_login_sessions()
+
     if auto_task and not auto_task.done():
         auto_task.cancel()
         try:
             await auto_task
-        except asyncio.CancelledError:
-            pass
         except Exception:
             pass
+
     await bot.session.close()
     logging.info("Bot shutdown complete.")
-
 
 # ================== RUN ==================
 if __name__ == "__main__":
